@@ -1,0 +1,18 @@
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+# Run Chrome as a normal window on a virtual screen instead of hidden mode.
+ENV HEADLESS=0
+# Show the bot's print() lines in Railway's logs right away.
+ENV PYTHONUNBUFFERED=1
+# Fast pace. sitecustomize.py sets the same values inside Python.
+ENV GAP_MIN=3
+ENV GAP_MAX=5
+ENV MIN_SECONDS_PER_ROUND=3
+ENV BROWSE_FIRST=0
+# Same start command that works for the Walmart bot (xvfb-run hung in this container).
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1366x768x24 -nolisten tcp & sleep 2; DISPLAY=:99 exec python amazon_monitor.py"]
