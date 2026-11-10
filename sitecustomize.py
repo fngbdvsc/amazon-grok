@@ -41,7 +41,7 @@ def _patch(mod):
             )
             # Amazon leaves "Temporarily out of stock" up while the price or
             # Add to Cart / Buy Now button is already on the page.
-            if v.get("price") is not None or has_button:
+            if v.get("price") is not None or has_button or v.get("offer_id"):
                 v["in_stock"] = True
             return v
 
