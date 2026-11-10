@@ -39,6 +39,7 @@ DISCORD_TOKEN = ""     # leave empty: set DISCORD_TOKEN in Railway Variables
 CHANNEL_ID = ""        # leave empty: set CHANNEL_ID in Railway Variables
 ROLE_ID = ""           # role to ping (leave "" for no ping)
 PROXY = ""             # optional: http://user:pass@host:port (leave "" for none)
+MAINTENANCE_CHANNEL_ID = 1569533434546757703   # errors, blocks and startup info (MAINTENANCE_CHANNEL_ID variable overrides)
 ALLOWED_USER_IDS = []  # optional: [123456789012345678]. Empty = anyone with "Manage Server" can use commands
 # =======================================================
 
@@ -804,9 +805,9 @@ class Monitor:
 
     def __init__(self, session, send_alert, send_text, proxy=None,
                  clock=time.monotonic, sleep=asyncio.sleep, rand=random.uniform,
-                 dashboard=None, shipper=None, session_factory=None, send_error=None):
+                 dashboard=None, shipper=None, session_factory=None, send_maint=None):
         self.session = session
-        self.send_error = send_error
+        self.send_maint = send_maint
         self.session_factory = session_factory
         self.referer = None
         self.dashboard = dashboard
@@ -832,6 +833,12 @@ class Monitor:
             self.watch = []        # the dashboard decides; start empty until the first sync
         else:
             self.watch = [s for s in (parse_asin(x) for x in WATCH_ASINS) if s]
+        # Pace, changeable with !speed. Saved in the config file; starts from GAP_MIN/GAP_MAX/MIN_SECONDS_PER_ROUND.
+        speed = cfg.get("speed") if isinstance(cfg, dict) else None
+        speed = speed if isinstance(speed, dict) else {}
+        self.gap_min = float(speed.get("gap_min", GAP_MIN))
+        self.gap_max = float(speed.get("gap_max", GAP_MAX))
+        self.min_round = float(speed.get("min_round", MIN_SECONDS_PER_ROUND))
 
         self.paused = False
         self.blocked_until = 0.0
@@ -860,33 +867,38 @@ class Monitor:
             self.shipper.push(kind, LOG_TAG + re.sub(r"[*`]", "", content), sku)
 
     def dash_error(self, key, content, sku=None):
-        """Every error goes to the Discord error channel; the dashboard gets the same one at most every ERROR_REPEAT_SECONDS."""
-        self.error_channel(content)
+        """Every error goes to the maintenance channel; the dashboard gets the same one at most every ERROR_REPEAT_SECONDS."""
+        self.maint_channel(content)
         now = self.clock()
         if now - self._err_seen.get(key, -1e9) < ERROR_REPEAT_SECONDS:
             return
         self._err_seen[key] = now
         self.dash_log("error", content, sku)
 
-    def error_channel(self, text):
-        """Copy an error to the Discord error channel (ERROR_CHANNEL_ID), without making the caller wait."""
-        if self.send_error is None:
+    def maint_channel(self, text):
+        """Post to the Discord maintenance channel (errors, blocks, startup info), without making the caller wait."""
+        if self.send_maint is None:
             return
 
         async def send():
             try:
-                await self.send_error(text)
+                await self.send_maint(text)
             except Exception as e:
-                print(f"[discord] couldn't send to the error channel: {e}")
+                print(f"[discord] couldn't send to the maintenance channel: {e}")
         try:
             asyncio.get_running_loop().create_task(send())
         except RuntimeError:
             pass
 
-    async def _say(self, text, kind="info", sku=None):
-        """Status messages. With the dashboard connected they go only there, so Discord just gets alerts."""
+    async def _say(self, text, kind="info", sku=None, to="main"):
+        """Status messages, always copied to the dashboard.
+        to="main": the main channel (only when there's no dashboard, or STATUS_IN_DISCORD=1).
+        to="maint": the maintenance channel, never the main channel.
+        to="dash": dashboard only (the maintenance channel already got its own copy)."""
         print(f"[status] {text}")
-        if not self.shipper or STATUS_IN_DISCORD:
+        if to == "maint":
+            self.maint_channel(text)
+        elif to == "main" and (not self.shipper or STATUS_IN_DISCORD):
             try:
                 await self.send_text(text)
             except Exception as e:
@@ -909,7 +921,11 @@ class Monitor:
         return changed
 
     def save_config(self):
-        save_json(CONFIG_FILE, {"watch": self.watch})
+        save_json(CONFIG_FILE, {"watch": self.watch, "speed": {"gap_min": self.gap_min, "gap_max": self.gap_max,
+                                                               "min_round": self.min_round}})
+
+    def pace_text(self):
+        return f"{self.gap_min:g}-{self.gap_max:g}s"
 
     def round_estimate(self):
         jobs = len(self.watch)
@@ -917,10 +933,10 @@ class Monitor:
             jobs += len(SEARCH_TERMS) * SEARCH_PAGES
         elif BROWSE_FIRST and jobs:
             jobs += 1
-        return max(int(jobs * (GAP_MIN + GAP_MAX) / 2), MIN_SECONDS_PER_ROUND if jobs else 0)
+        return max(int(jobs * (self.gap_min + self.gap_max) / 2), int(self.min_round) if jobs else 0)
 
     async def wait_turn(self):
-        gap = self.rand(GAP_MIN, GAP_MAX)
+        gap = self.rand(self.gap_min, self.gap_max)
         wait = self.last_request + gap - self.clock()
         if wait > 0:
             await self.sleep(wait)
@@ -940,7 +956,7 @@ class Monitor:
         random.shuffle(sku_jobs)              # different order every round, less robotic
         jobs.extend(sku_jobs)
         self.round = deque(jobs)
-        self.next_round_at = self.clock() + MIN_SECONDS_PER_ROUND
+        self.next_round_at = self.clock() + self.min_round
         self.round_no += 1
         self.verify_budget = MAX_VERIFY_PER_ROUND
 
@@ -977,7 +993,7 @@ class Monitor:
             msg = (f"The Amazon bot froze: its check loop hasn't moved for {stuck / 60:.0f} min (not paused, not "
                    f"waiting out a block). Restarting the bot now; Railway will start it again.")
             print(f"[watchdog] {msg}")
-            self.error_channel(msg)
+            self.maint_channel(msg)
             self.dash_log("error", msg)
             await asyncio.sleep(5)       # give the messages a moment to go out
             self.exit(1)
@@ -1013,7 +1029,7 @@ class Monitor:
                     places = ", ".join(f"{p} x{n}" if n > 1 else p
                                        for p, n in self.block_places.items())
                     await self._say(f"Back to normal{tries}: Amazon is returning real pages again, resuming checks. "
-                                    f"Blocked on: {places}. Got through on: {page_name(job)}.")
+                                    f"Blocked on: {places}. Got through on: {page_name(job)}.", to="maint")
             except Blocked as b:
                 first_block = not self.was_blocked
                 self.was_blocked = True
@@ -1034,16 +1050,16 @@ class Monitor:
                        f"after {good} page(s) loaded fine. I'm pausing ALL requests for {wait}, "
                        f"then I'll retry on my own. Amazon returned: {b}.")
                 print(f"[BLOCKED] (#{self.blocks_in_row} in a row) {msg}")
-                self.error_channel(f"BLOCKED (#{self.blocks_in_row} in a row): {msg}")
+                self.maint_channel(f"BLOCKED (#{self.blocks_in_row} in a row): {msg}")
                 now = self.clock()
-                if first_block:          # one message when a block starts, then an update every 10 minutes
+                if first_block:          # dashboard: one message when a block starts, then an update every 10 minutes
                     self.block_started = self.last_block_note = now
-                    await self._say(msg, kind="error")
+                    await self._say(msg, kind="error", to="dash")
                 elif now - self.last_block_note >= BLOCK_UPDATE_SECONDS:
                     self.last_block_note = now
                     await self._say(f"Still blocked by Amazon: {(now - self.block_started) / 60:.0f} min so far, "
                                     f"{self.blocks_in_row} tries in a row. Last blocked on: {where}. "
-                                    f"Next retry in {wait}.", kind="error")
+                                    f"Next retry in {wait}.", kind="error", to="maint")
                 self.backoff = min(self.backoff * 2, BACKOFF_MAX)
             except asyncio.CancelledError:
                 raise
@@ -1142,7 +1158,7 @@ class Monitor:
                 if tries < MAX_VERIFY_TRIES:
                     self.priority.append(("verify", asin, dict(meta, tries=tries)))
             if confirm:
-                await self._say(f"Added `{asin}` to the watchlist, but: {reason}", sku=asin)
+                await self._say(f"Added `{asin}` to the watchlist, but: {reason}", kind="error", sku=asin, to="maint")
             return
 
         name = v["name"] or meta.get("name") or self.names.get(asin) or asin
@@ -1315,12 +1331,40 @@ class Monitor:
 
         if cmd == "resume":
             self.paused = False
-            return f"Resumed. Checks continue (each request {GAP_MIN}-{GAP_MAX} seconds apart)."
+            return f"Resumed. Checks continue (each request {self.pace_text()} apart)."
+
+        if cmd == "speed":
+            if not args:
+                return (f"Right now: each request is {self.pace_text()} apart, and each round (every ASIN once) "
+                        f"takes at least {self.min_round:g}s, so each ASIN is checked about every "
+                        f"{self.round_estimate()}s.\n"
+                        f"Change it: `!speed MIN MAX` (seconds between requests), e.g. `!speed 3 5`. "
+                        f"Add a third number to change the shortest round too, e.g. `!speed 3 5 20`.")
+            try:
+                nums = [float(a) for a in args[:3]]
+            except ValueError:
+                return "Use numbers, e.g. `!speed 3 5` or `!speed 3 5 20`."
+            if len(nums) < 2:
+                return "Give both numbers, e.g. `!speed 3 5` (seconds between requests: shortest and longest)."
+            lo, hi = nums[0], nums[1]
+            if lo < 3 or hi < lo or hi > 600:
+                return ("The first number must be at least 3 (this bot never goes below 3 seconds), the second "
+                        "at least the first, and at most 600.")
+            if len(nums) == 3 and not 0 <= nums[2] <= 3600:
+                return "The round time must be between 0 and 3600 seconds."
+            self.gap_min, self.gap_max = lo, hi
+            if len(nums) == 3:
+                self.min_round = nums[2]
+            self.save_config()
+            return (f"Done: each request is now {self.pace_text()} apart, rounds take at least "
+                    f"{self.min_round:g}s, so each ASIN is checked about every {self.round_estimate()}s. "
+                    f"Faster checking means Amazon challenges the bot sooner; watch the maintenance channel. "
+                    f"This lasts until the next redeploy unless a Railway Volume is set up.")
 
         if cmd == "refresh":
             self.refresh = True
             return (f"Refresh queued: I'll start a fresh round now ({'search scan + ' if SEARCH_SCAN else ''}every watched ASIN). "
-                    f"The first request goes out within {GAP_MAX} seconds, and a full round takes about "
+                    f"The first request goes out within {self.gap_max:g} seconds, and a full round takes about "
                     f"{self.round_estimate()} seconds.")
 
         if cmd == "status":
@@ -1333,7 +1377,7 @@ class Monitor:
                 state = "running"
             since = int(self.clock() - self.last_request)
             return (f"Status: {state}\nWatching {len(self.watch)} ASIN(s), each checked about every "
-                    f"{self.round_estimate()}s (requests spaced {GAP_MIN}-{GAP_MAX}s apart).\n"
+                    f"{self.round_estimate()}s (requests spaced {self.pace_text()} apart).\n"
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
 
@@ -1359,6 +1403,7 @@ class Monitor:
                     "`!why ASIN` - the reason for my latest decision on one product\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - start a fresh check round right now\n"
+                    "`!speed` / `!speed MIN MAX [ROUND]` - show or change the seconds between requests\n"
                     "`!status` - am I running, blocked or paused")
         return None
 
@@ -1431,7 +1476,9 @@ def run_bot():
     if not token or not channel_raw:
         sys.exit("Missing DISCORD_TOKEN or CHANNEL_ID. Set them in Railway Variables.")
     channel_id = int(channel_raw)
-    error_channel_id = int(os.environ.get("ERROR_CHANNEL_ID", "").strip() or 0)   # every error is copied here
+    # Maintenance channel: errors, blocks and startup info go here, never to the main channel. Commands work in both.
+    maint_channel_id = int(os.environ.get("MAINTENANCE_CHANNEL_ID", "").strip() or MAINTENANCE_CHANNEL_ID)
+    command_channels = {channel_id, maint_channel_id}
 
     intents = discord.Intents.default()
     intents.message_content = True      # needed to read !commands (enable it in the Developer Portal too)
@@ -1450,7 +1497,7 @@ def run_bot():
                 return make_session(proxy)
             self.mon = Monitor(new_session(), self.post_alert, self.post_text,
                                proxy, dashboard=dash, shipper=shipper, session_factory=new_session,
-                               send_error=self.post_error if error_channel_id else None)
+                               send_maint=self.post_maint)
             self.bg = asyncio.create_task(self.run_monitor())
 
         async def run_monitor(self):
@@ -1478,7 +1525,8 @@ def run_bot():
                     f"Amazon bot online ({where}).\n{proxy_line}\n"
                     f"Method: {method}\n"
                     f"Alerts only for 'Ships from and sold by Amazon.ca'. Every request to Amazon is "
-                    f"{GAP_MIN}-{GAP_MAX}s apart. Type `!help` for commands."
+                    f"{self.mon.pace_text()} apart. Type `!help` for commands.",
+                    to="maint"
                 )
                 jobs = [self.mon.run(), self.mon.run_sync(), self.mon.run_watchdog()]
                 if self.shipper:
@@ -1493,18 +1541,18 @@ def run_bot():
             if ch is not None:
                 await ch.send(text[:1900])
 
-        async def post_error(self, text):
-            ch = self.get_channel(error_channel_id)
+        async def post_maint(self, text):
+            ch = self.get_channel(maint_channel_id)
             if ch is None:
                 try:
-                    ch = await self.fetch_channel(error_channel_id)
+                    ch = await self.fetch_channel(maint_channel_id)
                 except discord.NotFound:
-                    print(f"[discord] no channel has the ID {error_channel_id}. Re-copy it: right-click the "
-                          f"channel name > Copy Channel ID, and update ERROR_CHANNEL_ID.")
+                    print(f"[discord] no channel has the ID {maint_channel_id}. Re-copy it: right-click the "
+                          f"channel name > Copy Channel ID, and set MAINTENANCE_CHANNEL_ID.")
                     return
                 except discord.Forbidden:
-                    print(f"[discord] the bot isn't allowed into channel {error_channel_id}. Give it View Channel "
-                          f"and Send Messages in that channel's permissions.")
+                    print(f"[discord] the bot isn't allowed into the maintenance channel {maint_channel_id}. Give it "
+                          f"View Channel and Send Messages in that channel's permissions.")
                     return
             await ch.send(f"[{local_now():%I:%M %p}] [Amazon] {text}"[:1900])
 
@@ -1537,7 +1585,7 @@ def run_bot():
             return bool(perms and perms.manage_guild)
 
         async def on_message(self, message):
-            if message.author.bot or message.channel.id != channel_id:
+            if message.author.bot or message.channel.id not in command_channels:
                 return
             if not message.content.startswith("!"):
                 return
