@@ -211,24 +211,14 @@ def parse_asin(s):
     return s if ASIN_RE.match(s) else None
 
 
-def decide(prev, ok, explicit, first_run, offer_id=None):
+def decide(prev, ok, explicit, first_run):
     """'Restock' / 'New Item' if an alert should fire, else None.
-    prev: last known 'Amazon.ca in stock' (True/False/None), or {"ok", "offer_id"}.
-    A different offer id on a page that is still in stock is a new restock."""
-    if isinstance(prev, dict):
-        prev_ok = prev.get("ok")
-        prev_offer = prev.get("offer_id") or None
-    else:
-        prev_ok = prev
-        prev_offer = None
-    offer_changed = bool(offer_id) and bool(prev_offer) and offer_id != prev_offer
-    if not ok:
+    prev: last known 'Amazon.ca in stock' (True/False/None). ok: it is now."""
+    if not ok or prev is True:
         return None
-    if prev_ok is True and not offer_changed:
-        return None
-    if first_run and not explicit and not offer_changed:
-        return None
-    return "Restock" if (prev_ok is False or explicit or offer_changed) else "New Item"
+    if first_run and not explicit:
+        return None            # silent baseline on first start
+    return "Restock" if (prev is False or explicit) else "New Item"
 
 
 def money(v):
@@ -1183,21 +1173,16 @@ class Monitor:
         ok = is_ok(v)
         key = f"watch:{asin}"
         prev = self.state.get(key)
-        offer_id = v.get("offer_id")
-        self.state[key] = {"ok": ok, "offer_id": offer_id}
+        self.state[key] = ok
         prev_reason = self.reasons.get(asin, (None,))[0]
         reason = reason_text(v, ok)
         if self.set_reason(asin, reason):
             print(f"[{'watch' if explicit else 'verify'}] {asin}: {reason}")
 
-        kind = decide(prev, ok, explicit, self.first_run, offer_id)
+        kind = decide(prev, ok, explicit, self.first_run)
         if kind:
-            prev_offer = prev.get("offer_id") if isinstance(prev, dict) else None
-            offer_changed = bool(offer_id) and bool(prev_offer) and offer_id != prev_offer
             if kind == "Restock":
                 why = reason
-                if offer_changed:
-                    why = "New offer id on the product page. " + why
                 if prev_reason and prev_reason != reason and prev_reason != BLOCK_REASON:
                     why += f" Before: {prev_reason}"
             else:
