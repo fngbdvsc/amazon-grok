@@ -85,6 +85,7 @@ RECHECK_SECONDS = 120
 BACKOFF_START = int(os.environ.get("BLOCK_RETRY_SECONDS", "300"))
 BACKOFF_MAX = int(os.environ.get("BLOCK_RETRY_MAX", "1800"))
 BLOCK_UPDATE_SECONDS = 600     # while a block lasts, post a "still blocked" update this often
+WATCHDOG_SECONDS = 600         # if the check loop doesn't move for this long, the bot restarts itself
 
 EXCLUDE_WORDS = ["t-shirt", "shirt", " tee", "backpack", "slipper", "pencil", "balloon",
                  "jibbitz", "swim", "shoe", "costume", "bottle", "snack", "sock", "pajama",
@@ -549,7 +550,7 @@ class BrowserSession:
     async def _cookies(self):
         try:
             if self._ctx is not None and self._browser.is_connected():
-                return await self._ctx.storage_state()
+                return await asyncio.wait_for(self._ctx.storage_state(), 15)
         except Exception:
             pass
         return None
@@ -569,6 +570,13 @@ class BrowserSession:
         print("[browser] the Amazon tab crashed (usually means Chrome ran out of memory)")
 
     async def _start(self, storage_state=None):
+        try:
+            await asyncio.wait_for(self._start_inner(storage_state), 60)
+        except asyncio.TimeoutError:
+            await self.close()
+            raise TimeoutError("Chrome didn't start within 60 seconds")
+
+    async def _start_inner(self, storage_state=None):
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
@@ -647,29 +655,38 @@ class BrowserSession:
         return await self._page.content()
 
     async def get(self, url, headers=None, timeout=20, proxies=None):
+        """The whole page load has a time limit; if Chrome hangs anyway, give up on it and start a new one next time."""
         async with self._lock:
-            if self._page is None:
-                await self._start()
-            elif not self._alive():
-                await self._restart("it crashed or closed")
-            elif self._pages >= self.RECYCLE_PAGES:
-                await self._restart("routine memory cleanup")
-            referer = (headers or {}).get("Referer")
             try:
-                resp = await self._page.goto(url, referer=referer, wait_until="domcontentloaded",
-                                             timeout=(timeout + 10) * 1000)
-                await self._page.wait_for_timeout(random.uniform(1500, 3500))   # let the page finish loading
-                html = await self._dismiss_continue_shopping(url)
-            except Exception as e:
-                print(f"[browser] loading {url} failed: {type(e).__name__}: {str(e)[:300]}")
-                raise                      # a dead Chrome is restarted on the next request
-            finally:
-                self._pages += 1
-            try:
-                await self._page.goto("about:blank")   # free the heavy page while we wait
-            except Exception:
-                pass
-            return PageResult(html, resp.status if resp else 0)
+                return await asyncio.wait_for(self._get_inner(url, headers, timeout), timeout + 240)
+            except asyncio.TimeoutError:
+                print(f"[browser] Chrome stopped responding while loading {url}; it will be replaced")
+                self._crashed = True
+                raise TimeoutError(f"Chrome stopped responding while loading {url}")
+
+    async def _get_inner(self, url, headers, timeout):
+        if self._page is None:
+            await self._start()
+        elif not self._alive():
+            await self._restart("it crashed, closed or stopped responding")
+        elif self._pages >= self.RECYCLE_PAGES:
+            await self._restart("routine memory cleanup")
+        referer = (headers or {}).get("Referer")
+        try:
+            resp = await self._page.goto(url, referer=referer, wait_until="domcontentloaded",
+                                         timeout=(timeout + 10) * 1000)
+            await self._page.wait_for_timeout(random.uniform(1500, 3500))   # let the page finish loading
+            html = await self._dismiss_continue_shopping(url)
+        except Exception as e:
+            print(f"[browser] loading {url} failed: {type(e).__name__}: {str(e)[:300]}")
+            raise                      # a dead Chrome is restarted on the next request
+        finally:
+            self._pages += 1
+        try:
+            await self._page.goto("about:blank", timeout=10000)   # free the heavy page while we wait
+        except Exception:
+            pass
+        return PageResult(html, resp.status if resp else 0)
 
     async def describe(self):
         """Startup check through Chrome itself: version, window mode, and the IP Amazon will see."""
@@ -684,7 +701,7 @@ class BrowserSession:
                 ip = f"check failed ({type(e).__name__}: {str(e).splitlines()[0][:120]})"
             try:
                 await self._page.wait_for_timeout(500)
-                await self._page.goto("about:blank")
+                await self._page.goto("about:blank", timeout=10000)
             except Exception:
                 pass
             mode = "hidden (headless)" if HEADLESS else "normal window on a virtual screen"
@@ -693,16 +710,17 @@ class BrowserSession:
             return line
 
     async def close(self):
+        """Close Chrome, but never wait more than 15 seconds per step for a hung one."""
         self._closing = True
         for obj in (self._ctx, self._browser):
             if obj is not None:
                 try:
-                    await obj.close()
+                    await asyncio.wait_for(obj.close(), 15)
                 except Exception:
                     pass
         if self._pw is not None:
             try:
-                await self._pw.stop()
+                await asyncio.wait_for(self._pw.stop(), 15)
             except Exception:
                 pass
         self._pw = self._browser = self._ctx = self._page = None
@@ -801,6 +819,8 @@ class Monitor:
         self.clock = clock
         self.sleep = sleep
         self.rand = rand
+        self.alive_at = clock()
+        self.exit = os._exit
 
         st = load_json(STATE_FILE)
         self.first_run = st is None
@@ -946,9 +966,26 @@ class Monitor:
             self.round_open = True
         return self.round.popleft() if self.round else None
 
+    async def run_watchdog(self):
+        """If the check loop stops moving (a hung browser call), report it and restart the whole bot.
+        Railway starts it again on its own (railway.json: restartPolicyType ON_FAILURE)."""
+        while True:
+            await self.sleep(60)
+            stuck = self.clock() - self.alive_at
+            if stuck < WATCHDOG_SECONDS:
+                continue
+            msg = (f"The Amazon bot froze: its check loop hasn't moved for {stuck / 60:.0f} min (not paused, not "
+                   f"waiting out a block). Restarting the bot now; Railway will start it again.")
+            print(f"[watchdog] {msg}")
+            self.error_channel(msg)
+            self.dash_log("error", msg)
+            await asyncio.sleep(5)       # give the messages a moment to go out
+            self.exit(1)
+
     async def run(self):
         while True:
             job = None
+            self.alive_at = self.clock()   # heartbeat for the watchdog: the loop passes here every few seconds
             try:
                 if self.paused:
                     await self.sleep(1)
@@ -1443,12 +1480,13 @@ def run_bot():
                     f"Alerts only for 'Ships from and sold by Amazon.ca'. Every request to Amazon is "
                     f"{GAP_MIN}-{GAP_MAX}s apart. Type `!help` for commands."
                 )
-                jobs = [self.mon.run(), self.mon.run_sync()]
+                jobs = [self.mon.run(), self.mon.run_sync(), self.mon.run_watchdog()]
                 if self.shipper:
                     jobs.append(self.shipper.run())
                 await asyncio.gather(*jobs)
             except Exception as e:
-                print(f"[fatal] monitor stopped: {type(e).__name__}: {e}")
+                print(f"[fatal] monitor stopped: {type(e).__name__}: {e}. Restarting the bot.")
+                os._exit(1)              # Railway starts it again; better than answering Discord while checking nothing
 
         async def post_text(self, text):
             ch = self.get_channel(channel_id)
@@ -1458,8 +1496,16 @@ def run_bot():
         async def post_error(self, text):
             ch = self.get_channel(error_channel_id)
             if ch is None:
-                print(f"[discord] error channel {error_channel_id} not found (check ERROR_CHANNEL_ID and the bot's access)")
-                return
+                try:
+                    ch = await self.fetch_channel(error_channel_id)
+                except discord.NotFound:
+                    print(f"[discord] no channel has the ID {error_channel_id}. Re-copy it: right-click the "
+                          f"channel name > Copy Channel ID, and update ERROR_CHANNEL_ID.")
+                    return
+                except discord.Forbidden:
+                    print(f"[discord] the bot isn't allowed into channel {error_channel_id}. Give it View Channel "
+                          f"and Send Messages in that channel's permissions.")
+                    return
             await ch.send(f"[{local_now():%I:%M %p}] [Amazon] {text}"[:1900])
 
         async def post_alert(self, a):
