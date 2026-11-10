@@ -1359,13 +1359,17 @@ class Monitor:
             return (f"Done: each request is now {self.pace_text()} apart, rounds take at least "
                     f"{self.min_round:g}s, so each ASIN is checked about every {self.round_estimate()}s. "
                     f"Faster checking means Amazon challenges the bot sooner; watch the maintenance channel. "
-                    f"This lasts until the next redeploy unless a Railway Volume is set up.")
+                    f"`!refresh` puts it back to normal ({GAP_MIN:g}-{GAP_MAX:g}s).")
 
         if cmd == "refresh":
+            # Also undoes any !speed change: back to the bot's normal pace.
+            self.gap_min, self.gap_max, self.min_round = float(GAP_MIN), float(GAP_MAX), float(MIN_SECONDS_PER_ROUND)
+            self.save_config()
             self.refresh = True
-            return (f"Refresh queued: I'll start a fresh round now ({'search scan + ' if SEARCH_SCAN else ''}every watched ASIN). "
-                    f"The first request goes out within {self.gap_max:g} seconds, and a full round takes about "
-                    f"{self.round_estimate()} seconds.")
+            return (f"Refresh: speed is back to normal ({self.pace_text()} between requests, rounds at least "
+                    f"{self.min_round:g}s), and I'm starting a fresh round now "
+                    f"({'search scan + ' if SEARCH_SCAN else ''}every watched ASIN). The first request goes out "
+                    f"within {self.gap_max:g} seconds, and a full round takes about {self.round_estimate()} seconds.")
 
         if cmd == "status":
             if self.paused:
@@ -1402,7 +1406,7 @@ class Monitor:
                     "`!list` - what I'm watching and why each isn't alerting\n"
                     "`!why ASIN` - the reason for my latest decision on one product\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
-                    "`!refresh` - start a fresh check round right now\n"
+                    "`!refresh` - put the speed back to normal and start a fresh check round right now\n"
                     "`!speed` / `!speed MIN MAX [ROUND]` - show or change the seconds between requests\n"
                     "`!status` - am I running, blocked or paused")
         return None
