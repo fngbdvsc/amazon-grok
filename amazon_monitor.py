@@ -833,6 +833,11 @@ class Monitor:
             self.watch = []        # the dashboard decides; start empty until the first sync
         else:
             self.watch = [s for s in (parse_asin(x) for x in WATCH_ASINS) if s]
+        # Discord !watch / !remove made while the dashboard is connected (the bot can't write them to the dashboard).
+        self.discord_added = set(cfg.get("discord_added") or []) if isinstance(cfg, dict) else set()
+        self.discord_removed = set(cfg.get("discord_removed") or []) if isinstance(cfg, dict) else set()
+        self.dash_last = None          # the dashboard's ASIN list at the last sync
+        self.dash_paused_last = None   # the dashboard's pause setting at the last sync
         # Pace, changeable with !speed. Saved in the config file; starts from GAP_MIN/GAP_MAX/MIN_SECONDS_PER_ROUND.
         speed = cfg.get("speed") if isinstance(cfg, dict) else None
         speed = speed if isinstance(speed, dict) else {}
@@ -922,7 +927,9 @@ class Monitor:
 
     def save_config(self):
         save_json(CONFIG_FILE, {"watch": self.watch, "speed": {"gap_min": self.gap_min, "gap_max": self.gap_max,
-                                                               "min_round": self.min_round}})
+                                                               "min_round": self.min_round},
+                                "discord_added": sorted(self.discord_added),
+                                "discord_removed": sorted(self.discord_removed)})
 
     def pace_text(self):
         return f"{self.gap_min:g}-{self.gap_max:g}s"
@@ -1215,9 +1222,27 @@ class Monitor:
                     labels[asin] = label
             for asin, label in labels.items():
                 self.names.setdefault(asin, label)
-            added = [x for x in new if x not in self.watch]
-            removed = [x for x in self.watch if x not in new]
-            self.watch = new
+            # Discord commands work too, so apply only what CHANGED on the dashboard since the last sync;
+            # the newest change wins, whether it came from Discord or the dashboard.
+            if self.dash_last is None:
+                target = [x for x in new if x not in self.discord_removed]
+                target += [x for x in sorted(self.discord_added) if x not in target and x not in self.discord_removed]
+            else:
+                target = list(self.watch)
+                for x in new:
+                    if x not in self.dash_last:            # added on the dashboard
+                        self.discord_removed.discard(x)
+                        if x not in target:
+                            target.append(x)
+                for x in self.dash_last:
+                    if x not in new:                       # removed on the dashboard
+                        self.discord_added.discard(x)
+                        if x in target:
+                            target.remove(x)
+            self.dash_last = new
+            added = [x for x in target if x not in self.watch]
+            removed = [x for x in self.watch if x not in target]
+            self.watch = target
             for asin in added:
                 self.priority.append(("sku", asin, self.synced_once))   # confirm message only after the first sync
             for asin in removed:
@@ -1227,8 +1252,11 @@ class Monitor:
                 self.save_config()
                 if self.synced_once:
                     self.dash_log("info", f"Watchlist updated from the dashboard: {len(added)} added, "
-                                          f"{len(removed)} removed, {len(new)} total.")
-        if paused != self.paused:
+                                          f"{len(removed)} removed, {len(target)} total.")
+        # Only a CHANGE of the dashboard's pause button applies, so a Discord !pause / !resume isn't undone a minute later.
+        dash_changed = self.dash_paused_last is None or paused != self.dash_paused_last
+        self.dash_paused_last = paused
+        if dash_changed and paused != self.paused:
             self.paused = paused
             if self.synced_once or paused:
                 note = ("Paused from the dashboard. No requests to Amazon until you resume."
@@ -1263,8 +1291,8 @@ class Monitor:
             return None
         cmd, args = parts[0][1:].lower(), parts[1:]
 
-        if self.dashboard and cmd in ("watch", "add", "remove", "unwatch", "delete", "pause", "resume"):
-            return "The dashboard controls the ASIN list and pause/resume now. Make that change there."
+        dash_note = (" (Changed from Discord: the dashboard won't show this, but the bot keeps it until it's "
+                     "changed again in Discord or on the dashboard.)") if self.dashboard else ""
 
         if cmd in ("watch", "add"):
             if not args:
@@ -1279,6 +1307,8 @@ class Monitor:
                 else:
                     self.watch.append(asin)
                     self.priority.append(("sku", asin, True))
+                    self.discord_added.add(asin)
+                    self.discord_removed.discard(asin)
                     added.append(asin)
             if added:
                 self.save_config()
@@ -1286,7 +1316,7 @@ class Monitor:
             if added:
                 tail = " Resume with `!resume` to get the confirmation." if self.paused else \
                        " I'll check it next and tell you what it is and whether Amazon.ca is selling it."
-                out.append("Added: " + ", ".join(f"`{s}`" for s in added) + "." + tail)
+                out.append("Added: " + ", ".join(f"`{s}`" for s in added) + "." + tail + dash_note)
             if already:
                 out.append("Already watching: " + ", ".join(f"`{s}`" for s in already) + ".")
             if bad:
@@ -1303,6 +1333,8 @@ class Monitor:
                     self.watch.remove(asin)
                     self.round = deque(j for j in self.round if not (j[0] == "sku" and j[1] == asin))
                     self.priority = deque(j for j in self.priority if not (j[0] in ("sku", "verify") and j[1] == asin))
+                    self.discord_removed.add(asin)
+                    self.discord_added.discard(asin)
                     removed.append(asin)
                 else:
                     missing.append(a)
@@ -1310,7 +1342,7 @@ class Monitor:
                 self.save_config()
             out = []
             if removed:
-                out.append("Removed: " + ", ".join(f"`{s}`" for s in removed) + ".")
+                out.append("Removed: " + ", ".join(f"`{s}`" for s in removed) + "." + dash_note)
             if missing:
                 out.append("Wasn't watching: " + ", ".join(f"`{m}`" for m in missing) + ".")
             return " ".join(out)
@@ -1327,11 +1359,11 @@ class Monitor:
 
         if cmd == "pause":
             self.paused = True
-            return "Paused. I'm making NO requests to Amazon until you send `!resume`."
+            return "Paused. I'm making NO requests to Amazon until you send `!resume`." + dash_note
 
         if cmd == "resume":
             self.paused = False
-            return f"Resumed. Checks continue (each request {self.pace_text()} apart)."
+            return f"Resumed. Checks continue (each request {self.pace_text()} apart)." + dash_note
 
         if cmd == "speed":
             if not args:
@@ -1373,7 +1405,7 @@ class Monitor:
 
         if cmd == "status":
             if self.paused:
-                state = "PAUSED from the dashboard" if self.dashboard else "PAUSED by command"
+                state = "PAUSED"
             elif self.was_blocked:
                 state = (f"BLOCKED by Amazon for {(self.clock() - self.block_started) / 60:.0f} min "
                          f"({self.blocks_in_row} tries in a row), retrying on its own")
