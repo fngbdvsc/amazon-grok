@@ -861,6 +861,7 @@ class Monitor:
         self.round_no = 0
         self.priority = deque([("home",)])
         self.refresh = False
+        self.restart_chrome = False
         self.reasons = {}      # asin -> (text, time string)
         self.names = {}
         self.checked = {}      # asin -> clock time of last product-page check
@@ -1010,6 +1011,9 @@ class Monitor:
             job = None
             self.alive_at = self.clock()   # heartbeat for the watchdog: the loop passes here every few seconds
             try:
+                if self.restart_chrome:
+                    self.restart_chrome = False
+                    await self._restart_chrome()
                 if self.paused:
                     await self.sleep(1)
                     continue
@@ -1074,6 +1078,17 @@ class Monitor:
                 print(f"[error] {type(e).__name__}: {e}")
                 self.dash_error(f"exc:{type(e).__name__}", f"Unexpected error in the bot: {type(e).__name__}: {e}")
                 await self.sleep(5)
+
+    async def _restart_chrome(self):
+        """Close the current Chrome and open a new one. Used by !restartchrome."""
+        print("[browser] !restartchrome: closing Chrome and opening a new one")
+        try:
+            await self.session.close()
+        except Exception as e:
+            print(f"[browser] close during restart failed: {type(e).__name__}: {e}")
+        if self.session_factory is not None:
+            self.session = self.session_factory()
+        self.referer = None
 
     async def reset_session(self):
         """After a block, go back through the homepage; only throw away the browser if FRESH_BROWSER_ON_BLOCK."""
@@ -1393,6 +1408,12 @@ class Monitor:
                     f"Faster checking means Amazon challenges the bot sooner; watch the maintenance channel. "
                     f"`!refresh` puts it back to normal ({GAP_MIN:g}-{GAP_MAX:g}s).")
 
+        if cmd == "restartchrome":
+            if self.session_factory is None:
+                return "This bot isn't running Chrome, so there's nothing to restart."
+            self.restart_chrome = True
+            return "Restarting Chrome. The check in progress finishes or fails, then a new window opens and checks continue."
+
         if cmd == "refresh":
             # Also undoes any !speed change: back to the bot's normal pace.
             self.gap_min, self.gap_max, self.min_round = float(GAP_MIN), float(GAP_MAX), float(MIN_SECONDS_PER_ROUND)
@@ -1439,6 +1460,7 @@ class Monitor:
                     "`!why ASIN` - the reason for my latest decision on one product\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - put the speed back to normal and start a fresh check round right now\n"
+                    "`!restartchrome` - close Chrome and open a new window\n"
                     "`!speed` / `!speed MIN MAX [ROUND]` - show or change the seconds between requests\n"
                     "`!status` - am I running, blocked or paused")
         return None
