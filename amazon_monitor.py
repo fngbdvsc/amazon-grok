@@ -864,6 +864,7 @@ class Monitor:
         self.restart_chrome = False
         self.chrome_prove = False       # after !restartchrome, confirm the next product page that actually loads
         self.chrome_down_noted = False  # say "type !restartchrome" once, not on every failed check
+        self.last_check = None          # most recent product-page check, for !recent
         self.reasons = {}      # asin -> (text, time string)
         self.names = {}
         self.checked = {}      # asin -> clock time of last product-page check
@@ -926,6 +927,7 @@ class Monitor:
     def set_reason(self, asin, text):
         changed = self.reasons.get(asin, ("",))[0] != text
         self.reasons[asin] = (text, local_now().strftime("%I:%M:%S %p"))
+        self.last_check = {"asin": asin, "name": self.names.get(asin) or asin, "text": text, "at": local_now()}
         return changed
 
     def save_config(self):
@@ -1249,7 +1251,7 @@ class Monitor:
                 "url": product_url(asin), "img": meta.get("img"),
             })
         if confirm:
-            await self._say(f"Now watching **{name}** (`{asin}`). Right now: {reason}", sku=asin)
+            await self._say(f"Now watching **{name}** (`{asin}`). Right now: {reason}", sku=asin, to="maint")
 
     # ---- dashboard sync
     def apply_config(self, cfg):
@@ -1480,6 +1482,13 @@ class Monitor:
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
 
+        if cmd == "recent":
+            last = self.last_check
+            if not last:
+                return "No product page has been checked yet."
+            when = last["at"].strftime("%I:%M:%S %p")
+            return f"**{last['name']}** (`{last['asin']}`) at {when}: {last['text']}"
+
         if cmd == "why":
             if not args:
                 return "Usage: `!why ASIN`"
@@ -1500,6 +1509,7 @@ class Monitor:
                     "`!remove ASIN` - stop watching it\n"
                     "`!list` - what I'm watching and why each isn't alerting\n"
                     "`!why ASIN` - the reason for my latest decision on one product\n"
+                    "`!recent` - the most recent check: time, product, and what the page said\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - put the speed back to normal and start a fresh check round right now\n"
                     "`!restartchrome` - close Chrome and open a new window\n"
