@@ -862,6 +862,8 @@ class Monitor:
         self.priority = deque([("home",)])
         self.refresh = False
         self.restart_chrome = False
+        self.chrome_prove = False       # after !restartchrome, confirm the next product page that actually loads
+        self.chrome_down_noted = False  # say "type !restartchrome" once, not on every failed check
         self.reasons = {}      # asin -> (text, time string)
         self.names = {}
         self.checked = {}      # asin -> clock time of last product-page check
@@ -1076,8 +1078,29 @@ class Monitor:
                 raise
             except Exception as e:
                 print(f"[error] {type(e).__name__}: {e}")
-                self.dash_error(f"exc:{type(e).__name__}", f"Unexpected error in the bot: {type(e).__name__}: {e}")
+                text = f"Unexpected error in the bot: {type(e).__name__}: {e}"
+                if self.chrome_restart_error(text):
+                    self.note_chrome_down(text)
+                else:
+                    self.dash_error(f"exc:{type(e).__name__}", text)
                 await self.sleep(5)
+
+    def chrome_restart_error(self, text):
+        """True when Chrome itself died and !restartchrome is what fixes it."""
+        t = (text or "").lower()
+        return any(s in t for s in (
+            "blockingioerror", "resource temporarily unavailable", "targetclosederror",
+            "page crashed", "target closed", "has been closed", "chrome stopped responding",
+            "browser has been closed", "connection closed",
+        ))
+
+    def note_chrome_down(self, text):
+        """Tell Discord once. Further dead-Chrome checks stay in the logs until it is restarted."""
+        if self.chrome_down_noted:
+            print(f"[browser] still down: {text}")
+            return
+        self.chrome_down_noted = True
+        self.maint_channel(f"{text}\nChrome died. Type `!restartchrome`.")
 
     async def _restart_chrome(self):
         """Close the current Chrome and open a new one. Used by !restartchrome."""
@@ -1089,6 +1112,17 @@ class Monitor:
         if self.session_factory is not None:
             self.session = self.session_factory()
         self.referer = None
+        self.chrome_down_noted = False
+        try:
+            if hasattr(self.session, "_start"):
+                await self.session._start()
+        except Exception as e:
+            self.chrome_prove = False
+            await self._say(f"Chrome did not come back up ({type(e).__name__}: {e}). Type `!restartchrome` again.",
+                            kind="error", to="maint")
+            return
+        self.chrome_prove = True
+        await self._say("Chrome is back up and running. I'll confirm once the next product page loads.", to="maint")
 
     async def reset_session(self):
         """After a block, go back through the homepage; only throw away the browser if FRESH_BROWSER_ON_BLOCK."""
@@ -1174,7 +1208,10 @@ class Monitor:
                 reason += asin_hint(asin)
             if self.set_reason(asin, reason):
                 print(f"[not posted] {asin}: {reason}")
-            self.dash_error(f"unreadable:{asin}", f"{asin}: {reason}", asin)
+            if self.chrome_restart_error(status) or self.chrome_restart_error(reason):
+                self.note_chrome_down(f"{asin}: {reason}")
+            else:
+                self.dash_error(f"unreadable:{asin}", f"{asin}: {reason}", asin)
             if not explicit and meta.get("tries") is not None:
                 tries = meta["tries"] + 1
                 if tries < MAX_VERIFY_TRIES:
@@ -1185,6 +1222,11 @@ class Monitor:
 
         name = v["name"] or meta.get("name") or self.names.get(asin) or asin
         self.names[asin] = name
+        if self.chrome_prove:
+            self.chrome_prove = False
+            self.chrome_down_noted = False
+            stock = "in stock" if v.get("in_stock") else "out of stock"
+            await self._say(f"Working again. `{asin}` is {stock}.", to="maint")
         ok = is_ok(v)
         key = f"watch:{asin}"
         prev = self.state.get(key)
@@ -1412,7 +1454,7 @@ class Monitor:
             if self.session_factory is None:
                 return "This bot isn't running Chrome, so there's nothing to restart."
             self.restart_chrome = True
-            return "Restarting Chrome. The check in progress finishes or fails, then a new window opens and checks continue."
+            return "Restarting Chrome. I'll tell you when the new window is up, and again when the next product page loads."
 
         if cmd == "refresh":
             # Also undoes any !speed change: back to the bot's normal pace.
