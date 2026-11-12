@@ -924,10 +924,11 @@ class Monitor:
                       f"{alert['kind']}: {alert['name']} | {money(v)} | Seller: {seller_text(v)} | "
                       f"ASIN {alert['sku']} | {alert['why']}", alert["sku"])
 
-    def set_reason(self, asin, text):
+    def set_reason(self, asin, text, stock=None):
         changed = self.reasons.get(asin, ("",))[0] != text
         self.reasons[asin] = (text, local_now().strftime("%I:%M:%S %p"))
-        self.last_check = {"asin": asin, "name": self.names.get(asin) or asin, "text": text, "at": local_now()}
+        self.last_check = {"asin": asin, "name": self.names.get(asin) or asin, "text": text,
+                           "stock": stock, "at": local_now()}
         return changed
 
     def save_config(self):
@@ -1235,7 +1236,7 @@ class Monitor:
         self.state[key] = ok
         prev_reason = self.reasons.get(asin, (None,))[0]
         reason = reason_text(v, ok)
-        if self.set_reason(asin, reason):
+        if self.set_reason(asin, reason, v.get("in_stock")):
             print(f"[{'watch' if explicit else 'verify'}] {asin}: {reason}")
 
         kind = decide(prev, ok, explicit, self.first_run)
@@ -1482,12 +1483,39 @@ class Monitor:
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
 
+        if cmd == "requesttime":
+            if not args:
+                return (f"Right now each request is {self.pace_text()} apart.\n"
+                        f"Change it: `!requesttime 4` for 4 seconds, or `!requesttime 3 5` for a range. "
+                        f"The shortest allowed is 3 seconds.")
+            try:
+                nums = [float(a) for a in args[:2]]
+            except ValueError:
+                return "Use numbers, e.g. `!requesttime 4` or `!requesttime 3 5`."
+            if len(nums) == 1:
+                lo = hi = nums[0]
+            else:
+                lo, hi = nums
+            if lo < 3 or hi < lo or hi > 600:
+                return ("The first number must be at least 3, the second at least the first, and at most 600. "
+                        "Example: `!requesttime 3 5`.")
+            self.gap_min, self.gap_max = lo, hi
+            self.save_config()
+            return (f"Done. Each request is now {self.pace_text()} apart, so each product is checked about every "
+                    f"{self.round_estimate()}s. `!refresh` puts it back to {GAP_MIN:g}-{GAP_MAX:g}s.")
+
         if cmd == "recent":
             last = self.last_check
             if not last:
                 return "No product page has been checked yet."
             when = last["at"].strftime("%I:%M:%S %p")
-            return f"**{last['name']}** (`{last['asin']}`) at {when}: {last['text']}"
+            if last.get("stock") is True:
+                state = "In stock."
+            elif last.get("stock") is False:
+                state = "Out of stock."
+            else:
+                state = "Page not read."
+            return f"**{last['name']}** (`{last['asin']}`) at {when}: {state} {last['text']}"
 
         if cmd == "why":
             if not args:
@@ -1509,7 +1537,8 @@ class Monitor:
                     "`!remove ASIN` - stop watching it\n"
                     "`!list` - what I'm watching and why each isn't alerting\n"
                     "`!why ASIN` - the reason for my latest decision on one product\n"
-                    "`!recent` - the most recent check: time, product, and what the page said\n"
+                    "`!recent` - the most recent check: time, product, and in stock or out of stock\n"
+                    "`!requesttime` / `!requesttime SECONDS` - show or change the wait between requests\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - put the speed back to normal and start a fresh check round right now\n"
                     "`!restartchrome` - close Chrome and open a new window\n"
